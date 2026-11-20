@@ -1,0 +1,56 @@
+{
+  "id": "sample-wedding-2028",
+  "names": [
+    "Partner One",
+    "Partner Two"
+  ],
+  "date": "2028-12-01",
+  "tagline": "Our next chapter.",
+  "announcement": "We\u2019re getting married!",
+  "heading": "Celebrate with us.",
+  "intro": "Our favourite people, together for our favourite day.",
+  "venue": {
+    "name": "Your wedding venue",
+    "city": "Your city",
+    "address": "Your full venue address",
+    "mapQuery": "Your venue and city"
+  },
+  "story": [
+    {
+      "image": "assets/story-1.svg",
+      "caption": "Our story begins"
+    },
+    {
+      "image": "assets/story-2.svg",
+      "caption": "A little surprise"
+    },
+    {
+      "image": "assets/story-3.svg",
+      "caption": "A big yes"
+    },
+    {
+      "image": "assets/story-4.svg",
+      "caption": "Our favourite people"
+    },
+    {
+      "image": "assets/couple.svg",
+      "caption": "Save the date"
+    }
+  ],
+  "venueImage": "assets/venue.svg",
+  "theme": {
+    "paper": "#f7f4e9",
+    "ink": "#273e35",
+    "olive": "#596943",
+    "rose": "#c37664"
+  },
+  "uploads": {
+    "enabled": true,
+    "opensAt": "2028-11-25T00:00:00+05:30",
+    "closesAt": "2028-12-15T00:00:00+05:30",
+    "maxFileBytes": 52428800,
+    "maxFilesPerInvite": 100,
+    "maxBytesPerInvite": 2147483648
+  },
+  "galleryUrl": ""
+}

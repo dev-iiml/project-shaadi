@@ -1,0 +1,45 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {once} from 'node:events';
+import {createApp} from '../server/index.mjs';
+import {AppError} from '../server/domain.mjs';
+// In-memory adapters exercise HTTP contracts. Real Google behaviour is a separate launch check.
+class MemoryDB{
+ constructor(){this.rows=new Map();this.tail=Promise.resolve();}
+ collection(path){return new Collection(this,path);}
+ async runTransaction(fn){const previous=this.tail;let unlock;this.tail=new Promise(r=>unlock=r);await previous;try{return await fn({get:r=>r.get(),update:(r,d)=>r.update(d),create:(r,d)=>r.create(d)});}finally{unlock();}}
+}
+class Collection{
+ constructor(db,path,filter=null,cap=Infinity){Object.assign(this,{db,path,filter,cap});}
+ doc(id){return new Ref(this.db,this.path+'/'+id);}
+ where(field,op,value){assert.equal(op,'==');return new Collection(this.db,this.path,[field,value],this.cap);}
+ limit(cap){return new Collection(this.db,this.path,this.filter,cap);}
+ async get(){const prefix=this.path+'/';return {docs:[...this.db.rows.entries()].filter(([p,d])=>p.startsWith(prefix)&&!p.slice(prefix.length).includes('/')&&(!this.filter||d[this.filter[0]]===this.filter[1])).slice(0,this.cap).map(([p,d])=>({id:p.slice(prefix.length),data:()=>structuredClone(d)}))};}
+}
+class Ref{
+ constructor(db,path){Object.assign(this,{db,path,id:path.split('/').pop()});}
+ collection(name){return new Collection(this.db,this.path+'/'+name);}
+ async get(){const d=this.db.rows.get(this.path);return {exists:d!==undefined,data:()=>structuredClone(d)};}
+ async create(d){if(this.db.rows.has(this.path))throw Error('exists');this.db.rows.set(this.path,structuredClone(d));}
+ async update(d){assert.ok(this.db.rows.has(this.path));Object.assign(this.db.rows.get(this.path),structuredClone(d));}
+}
+class FakeGoogle{
+ constructor(){this.sessions=new Map();this.counter=0;this.moves=0;this.sheetError=false;}
+ async folder(){return 'folder'+(++this.counter);}
+ async generatedId(){return 'file'+(++this.counter);}
+ async createSession(data){const uri='https://www.googleapis.com/session/'+data.fileId;this.sessions.set(uri,{...data,bytes:Buffer.alloc(0)});return uri;}
+ async status(s){const d=this.sessions.get(s.uri);return d.bytes.length===d.size?new Response('{}',{status:200}):new Response(null,{status:308,headers:d.bytes.length?{range:'bytes=0-'+(d.bytes.length-1)}:{}});}
+ async put(s,offset,bytes){const d=this.sessions.get(s.uri);assert.equal(d.bytes.length,offset);d.bytes=Buffer.concat([d.bytes,bytes]);return this.status(s);}
+ async metadata(id){const d=[...this.sessions.values()].find(d=>d.fileId===id);return {id,size:String(d.bytes.length),mimeType:d.mime,parents:[d.parent]};}
+ async move(id,from,to){const d=[...this.sessions.values()].find(d=>d.fileId===id);assert.equal(d.parent,from);d.parent=to;this.moves++;}
+ async sheet(){if(this.sheetError)throw Error('sheet down');}
+}
+const env={GOOGLE_CLIENT_ID:'client',GOOGLE_CLIENT_SECRET:'secret',GOOGLE_REFRESH_TOKEN:'refresh',INVITE_SECRET:'i'.repeat(64),ADMIN_SECRET:'a'.repeat(64),PENDING_FOLDER_ID:'pending',APPROVED_FOLDER_ID:'approved',SHEET_ID:'sheet',PUBLIC_ORIGIN:'https://wedding.example'};
+const event={id:'test-event',uploads:{enabled:true,opensAt:'2020-01-01T00:00:00Z',closesAt:'2099-01-01T00:00:00Z',maxFileBytes:52428800,maxFilesPerInvite:3,maxBytesPerInvite:100000000}};
+async function fixture(t){const db=new MemoryDB(),google=new FakeGoogle(),server=createApp({env,event,db,google});server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>new Promise(r=>{server.closeAllConnections();server.close(r);}));const base='http://127.0.0.1:'+server.address().port;async function request(path,{token=env.ADMIN_SECRET,method='GET',data,raw,headers={}}={}){const r=await fetch(base+path,{method,headers:{Authorization:'Bearer '+token,...(raw?{}:{'Content-Type':'application/json'}),...headers},...(data?{body:JSON.stringify(data)}:raw?{body:raw}:{})});return {status:r.status,data:await r.json()};}return {db,google,request};}
+async function invite(f,allowStay=false){const r=await f.request('/api/admin/invites',{method:'POST',data:{name:'Guest',maxGuests:2,allowStay}});assert.equal(r.status,201);return new URLSearchParams(new URL(r.data.url).hash.slice(1)).get('invite');}
+test('HTTP authentication, cross-origin protection and revocation',async t=>{const f=await fixture(t),token=await invite(f);assert.equal((await f.request('/api/invite',{token})).status,200);assert.equal((await f.request('/api/invite',{token:'invalid'})).status,401);assert.equal((await f.request('/api/invite',{token,headers:{Origin:'https://evil.example'}})).status,403);assert.equal((await f.request('/api/admin/invites',{token})).status,401);const id=token.split('.')[0];await f.request('/api/admin/invites/'+id+'/revoke',{method:'POST'});assert.equal((await f.request('/api/invite',{token})).status,401);});
+test('RSVP is durable if Sheet fails, and owner can repair projection',async t=>{const f=await fixture(t),token=await invite(f);f.google.sheetError=true;const r=await f.request('/api/rsvp',{token,method:'POST',data:{guestName:'Me',attending:'Yes',partyType:'Solo',guestCount:1,stayingOver:'Yes',stayingCount:1}});assert.equal(r.status,200);assert.equal(r.data.sheetSynced,false);const g=await f.request('/api/invite',{token});assert.equal(g.data.rsvp.guestCount,1);assert.equal(g.data.rsvp.stayingCount,0);f.google.sheetError=false;assert.equal((await f.request('/api/admin/invites/'+token.split('.')[0]+'/sync',{method:'POST'})).status,200);assert.equal((await f.request('/api/admin/invites')).data.guests[0].sheetSynced,true);});
+test('resumable upload keeps exact bytes, is isolated, and requires owner approval',async t=>{const f=await fixture(t),token=await invite(f),other=await invite(f),id='c'.repeat(32),bytes=Buffer.alloc(262144+32,127);Buffer.from([255,216,255]).copy(bytes);const r=await f.request('/api/uploads',{token,method:'POST',data:{id,size:bytes.length,mime:'image/jpeg',name:'original.jpg'}});assert.equal(r.status,201);assert.equal((await f.request('/api/uploads/'+id,{token:other})).status,403);assert.equal((await f.request('/api/uploads/'+id,{token})).data.offset,0);assert.equal((await f.request('/api/uploads/'+id+'?offset=0',{token,method:'PUT',raw:bytes.subarray(0,262144)})).data.offset,262144);assert.equal((await f.request('/api/uploads/'+id+'?offset=0',{token,method:'PUT',raw:bytes.subarray(0,262144)})).status,409);const final=await f.request('/api/uploads/'+id+'?offset=262144',{token,method:'PUT',raw:bytes.subarray(262144)});assert.equal(final.data.status,'pending');assert.equal((await f.request('/api/uploads/'+id,{token})).data.status,'pending');assert.ok([...f.google.sessions.values()][0].bytes.equals(bytes));assert.equal((await f.request('/api/admin/photos',{token})).status,401);assert.equal((await f.request('/api/admin/photos')).data.photos.length,1);assert.equal((await f.request('/api/admin/photos/'+id+'/approve',{method:'POST'})).status,200);assert.equal(f.google.moves,1);assert.equal((await f.request('/api/admin/photos')).data.photos.length,0);assert.equal((await f.request('/api/admin/photos/'+id+'/approve',{method:'POST'})).status,409);assert.equal(f.google.moves,1);});
+test('renamed non-images are rejected before any bytes reach Drive',async t=>{const f=await fixture(t),token=await invite(f),id='d'.repeat(32),raw=Buffer.from('<script>malicious</script>');await f.request('/api/uploads',{token,method:'POST',data:{id,size:raw.length,mime:'image/jpeg',name:'x.jpg'}});assert.equal((await f.request('/api/uploads/'+id+'?offset=0',{token,method:'PUT',raw})).status,400);assert.equal([...f.google.sessions.values()][0].bytes.length,0);});
+
+test('lost final acknowledgement is recoverable without a duplicate file',async t=>{const f=await fixture(t),token=await invite(f),id='e'.repeat(32),raw=Buffer.alloc(32,1);Buffer.from([255,216,255]).copy(raw);await f.request('/api/uploads',{token,method:'POST',data:{id,size:raw.length,mime:'image/jpeg',name:'once.jpg'}});const put=f.google.put.bind(f.google);f.google.put=async(...args)=>{await put(...args);throw new AppError(502,'Acknowledgement lost.');};assert.equal((await f.request('/api/uploads/'+id+'?offset=0',{token,method:'PUT',raw})).status,502);assert.equal((await f.request('/api/uploads/'+id,{token})).data.status,'pending');assert.equal(f.google.sessions.size,1);assert.equal((await f.request('/api/admin/photos')).data.photos.length,1);});
+test('reservations enforce limits and repeated initiation uses the same slot',async t=>{const f=await fixture(t),token=await invite(f),id='f'.repeat(32),data={id,size:32,mime:'image/jpeg',name:'original.jpg'};assert.equal((await f.request('/api/uploads',{token,method:'POST',data})).status,201);assert.equal((await f.request('/api/uploads',{token,method:'POST',data})).status,200);assert.equal(f.google.sessions.size,1);for(const digit of ['1','2'])assert.equal((await f.request('/api/uploads',{token,method:'POST',data:{...data,id:digit.repeat(32)}})).status,201);assert.equal((await f.request('/api/uploads',{token,method:'POST',data:{...data,id:'3'.repeat(32)}})).status,429);});

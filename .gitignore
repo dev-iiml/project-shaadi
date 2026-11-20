@@ -1,0 +1,9 @@
+node_modules/
+public/
+.private/
+.env
+.env.*
+!.env.example
+.firebase/
+.firebaserc
+*.zip

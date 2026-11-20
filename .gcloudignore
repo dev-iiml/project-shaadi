@@ -1,0 +1,8 @@
+.git
+node_modules
+.private
+.env*
+public
+web
+original-site
+*.zip
